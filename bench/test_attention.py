@@ -1,7 +1,10 @@
 from xformers.components import build_attention
 import xformers.ops as xops
-from model.modeling_chatglm import attention_fn
 import torch
+import sys
+sys.path.insert(1, '/home/nfs_data/zhanggh/ChatGLM-X/')
+from model.origin_modeling_chatglm import attention_fn
+
 
 def check_given():
   B = 1
@@ -19,12 +22,12 @@ def check_given():
   }
 
   additive_mask = torch.triu(
-            torch.ones(SEQ, SEQ).float().cuda() * float("-inf"),
+            torch.ones(SEQ, SEQ).half().cuda() * float("-inf"),
             diagonal=1,
         )
   print(additive_mask)
   attention = build_attention(my_config)
-  q = torch.arange(0, B * SEQ * MODEL).view(B, SEQ, HEADS, MODEL // HEADS).float().cuda() / 10
+  q = torch.arange(0, B * SEQ * MODEL).view(B, SEQ, HEADS, MODEL // HEADS).half().cuda() / 10
   q = q.transpose(1,2)
   k = q
   v = q
@@ -35,7 +38,7 @@ def check_given():
   print("xformes output: ", output)
 
 
-  attention_mask = torch.ones((B, SEQ, SEQ)).cuda()
+  attention_mask = torch.ones((B, SEQ, SEQ)).half().cuda()
   attention_mask.tril_()
   attention_mask.unsqueeze_(1)
   attention_mask = (attention_mask < 0.5).bool()
@@ -45,7 +48,7 @@ def check_given():
       self.scale_mask_softmax = False
 
   temp = Temp()
-  q = torch.arange(0, B * SEQ * MODEL).view(B, SEQ, HEADS, MODEL // HEADS).float().cuda() / 10
+  q = torch.arange(0, B * SEQ * MODEL).view(B, SEQ, HEADS, MODEL // HEADS).half().cuda() / 10
 
   q = q.transpose(0, 1).view(B * SEQ, HEADS, MODEL // HEADS)
   k = q
@@ -72,34 +75,6 @@ def check_chatglm_attention(B, SEQ, MODEL, q, k, v, output):
   layer_id = 1
   chatglm_output = attention_fn(temp, q, k, v, attention_mask, MODEL, layer_id, scaling_attention_score=True)[0]
   print(torch.allclose(output, chatglm_output))
-
-def check_scaled_dot_product():
-  B = 2
-  SEQ = 1024
-  MODEL = 4096
-  HEADS = 32
-
-  attention_name = "scaled_dot_product"
-  my_config = {
-      "name": attention_name,
-      "seq_len": SEQ,
-      "model_dim": MODEL,
-      "num_heads": HEADS,
-      "dropout": 0.0,
-      "causal": True
-  }
-
-  attention = build_attention(my_config)
-  q = torch.rand((B, HEADS, SEQ, MODEL // HEADS)).float().cuda()
-  k = torch.rand((B, HEADS, SEQ, MODEL // HEADS)).float().cuda()
-  v = torch.rand((B, HEADS, SEQ, MODEL // HEADS)).float().cuda()
-  q_in = q.view(B * HEADS, SEQ, MODEL // HEADS)
-  k_in = k.view(B * HEADS, SEQ, MODEL // HEADS)
-  v_in = v.view(B * HEADS, SEQ, MODEL // HEADS)
-  torch.cuda.cudart().cudaProfilerStart()
-  output = attention(q_in, k_in, v_in).view(B, HEADS, SEQ, MODEL // HEADS).permute(2, 0, 1, 3).contiguous().view(SEQ, B, MODEL)
-  torch.cuda.cudart().cudaProfilerStop()
-  check_chatglm_attention(B, SEQ, MODEL, q.permute(2, 0, 1, 3), k.permute(2, 0, 1, 3), v.permute(2, 0, 1, 3), output)
 
 def check_scaled_dot_product_with_mask():
   B = 2
@@ -145,7 +120,7 @@ def check_given_mask():
   q = torch.arange(0, B * SEQ * MODEL).view(SEQ, B, HEADS, MODEL // HEADS).half().cuda() / 10
   k = q
   v = q
-  attention_mask = torch.ones((B, SEQ, SEQ)).cuda()
+  attention_mask = torch.ones((B, SEQ, SEQ)).half().cuda()
   attention_mask.tril_()
   attention_mask.unsqueeze_(1)
   attention_mask = (attention_mask < 0.5).bool()
@@ -178,26 +153,91 @@ def check_given_mask():
   print(output)
   print(torch.allclose(output, chatglm_output))
 
+def check_memeff_attention_given():
+  B = 2
+  SEQ = 4
+  MODEL = 16
+  HEADS = 2
+  q = torch.arange(0, B * SEQ * MODEL).view(SEQ, B, HEADS, MODEL // HEADS).half().cuda() / 10
+  k = q
+  v = q
+  attention_mask = torch.ones((B, SEQ, SEQ)).half().cuda()
+  attention_mask.tril_()
+  attention_mask.unsqueeze_(1)
+  attention_mask = (attention_mask < 0.5).bool()
+  class Temp:
+    def __init__(self, **kwargs):
+      self.scale_mask_softmax = False
+
+  temp = Temp()
+  layer_id = 1
+  chatglm_output = attention_fn(temp, q, k, v, attention_mask, MODEL, layer_id, scaling_attention_score=True)[0]
+
+  key_layer = k.permute(1, 2, 0, 3).contiguous().view(B * HEADS, SEQ, MODEL // HEADS)
+  query_layer = q.permute(1, 2, 0, 3).contiguous().view(B * HEADS, SEQ, MODEL // HEADS)
+  value_layer = v.permute(1, 2, 0, 3).contiguous().view(B * HEADS, SEQ, MODEL // HEADS)
+  # addtitive_mask = xops.LowerTriangularMask()
+  addtitive_mask = torch.zeros_like(attention_mask.squeeze(1)).masked_fill_(attention_mask.squeeze(1), float('-inf'))
+  # Repeat the mask for all heads
+  addtitive_mask = addtitive_mask.repeat(HEADS, 1, 1).half()
+  output = xops.memory_efficient_attention(
+    query_layer, key_layer, value_layer,
+    attn_bias=addtitive_mask
+  ).view(B, HEADS, SEQ, MODEL // HEADS).permute(2, 0, 1, 3).contiguous().view(SEQ, B, MODEL)
+  print(torch.allclose(output, chatglm_output))
+  print(output)
+  print(chatglm_output)
+
 
 def check_memeff_attention():
-  B = 2
+  B = 1
   SEQ = 1024
   MODEL = 4096
   HEADS = 32
-  q = torch.rand((B, HEADS, SEQ, MODEL // HEADS)).float().cuda()
-  k = torch.rand((B, HEADS, SEQ, MODEL // HEADS)).float().cuda()
-  v = torch.rand((B, HEADS, SEQ, MODEL // HEADS)).float().cuda()
-  q_in = q.view(B * HEADS, SEQ, MODEL // HEADS)
-  k_in = k.view(B * HEADS, SEQ, MODEL // HEADS)
-  v_in = v.view(B * HEADS, SEQ, MODEL // HEADS)
-  addtitive_mask = xops.LowerTriangularMask()
-  torch.cuda.cudart().cudaProfilerStart()
+  # B = 2
+  # SEQ = 4096
+  # MODEL = 1024
+  # HEADS = 8
+  q = torch.rand((SEQ, B, HEADS, MODEL // HEADS)).half().cuda()
+  k = torch.rand((SEQ, B, HEADS, MODEL // HEADS)).half().cuda()
+  v = torch.rand((SEQ, B, HEADS, MODEL // HEADS)).half().cuda()
+  attention_mask = torch.ones((B, SEQ, SEQ)).cuda()
+  attention_mask.tril_()
+  attention_mask.unsqueeze_(1)
+  attention_mask = (attention_mask < 0.5).bool()
+  # attention_mask = torch.zeros((B, 1, SEQ, SEQ)).bool().cuda()
+  class Temp:
+    def __init__(self, **kwargs):
+      self.scale_mask_softmax = False
+
+  temp = Temp()
+  layer_id = 1
+  q_in = q
+  k_in = k
+  v_in = v
+  chatglm_output = attention_fn(temp, q_in, k_in, v_in, attention_mask, MODEL, layer_id, scaling_attention_score=True)[0]
+  print(chatglm_output.shape)
+
+  key_layer = k.transpose(0,1)
+  query_layer = q.transpose(0,1)
+  value_layer = v.transpose(0,1)
+  addtitive_mask = torch.zeros(attention_mask.shape).half().cuda().masked_fill_(attention_mask, float('-inf'))
+  
+  addtitive_mask = addtitive_mask.expand(B, HEADS, SEQ, SEQ)#.view(B * HEADS, SEQ, SEQ)
+  # addtitive_mask = torch.zeros((B, HEADS, SEQ, SEQ)).half().cuda()
+
+  #torch.cuda.cudart().cudaProfilerStart()
   output = xops.memory_efficient_attention(
-    q_in, k_in, v_in,
-    attn_bias=addtitive_mask
-  ).view(B, HEADS, SEQ, MODEL // HEADS).permute(2, 0, 1, 3).contiguous().view(SEQ, B, MODEL)
-  torch.cuda.cudart().cudaProfilerStop()
-  check_chatglm_attention(B, SEQ, MODEL, q, k, v, output)
+    query_layer, key_layer, value_layer, attn_bias=addtitive_mask, op = (xops.fmha.cutlass.FwOp, None)#
+  )
+  print(output.shape)
+  output = output.transpose(0,1).view(SEQ, B, MODEL)
+  # torch.cuda.cudart().cudaProfilerStop()
+  # print all the positions that are not equal
+  diff_ids = torch.nonzero(torch.logical_not(torch.isclose(output, chatglm_output)))
+  # print the output indexed by diff_ids
+  print(output[diff_ids[:,0], diff_ids[:,1], diff_ids[:,2]])
+  print(chatglm_output[diff_ids[:,0], diff_ids[:,1], diff_ids[:,2]])  
 
 if __name__ == "__main__":
   SEED = 0 
@@ -205,6 +245,7 @@ if __name__ == "__main__":
   torch.cuda.manual_seed(SEED) 
   #check_given()
   #check_scaled_dot_product()
-  #check_memeff_attention()
+  check_memeff_attention()
   #check_scaled_dot_product_with_mask()
-  check_given_mask()
+  #check_given_mask()
+  #check_memeff_attention_given()

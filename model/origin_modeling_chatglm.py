@@ -33,8 +33,6 @@ from transformers.generation.utils import LogitsProcessorList, StoppingCriteriaL
 from .configuration_chatglm import ChatGLMConfig
 from xformers.components import build_attention
 import xformers.ops as xops
-from xformers.triton.fused_linear_layer import FusedLinear
-from xformers.components import Activation
 
 # flags required to enable jit fusion kernels
 
@@ -262,10 +260,6 @@ def attention_fn(
 
     # seqlen, batch, num_attention_heads, hidden_size_per_attention_head
     seq_len, b, nh, hidden_size = key_layer.shape
-
-    #print("Q: ", query_layer.shape)
-    #print("K: ", key_layer.shape)
-    #print("V: ", value_layer.shape)
     if use_cache:
         present = (key_layer, value_layer)
     else:
@@ -352,92 +346,6 @@ def attention_fn(
 
     return outputs
 
-def xformer_attention_fn(
-        self,
-        query_layer,
-        key_layer,
-        value_layer,
-        attention_mask,
-        hidden_size_per_partition,
-        layer_id,
-        layer_past=None,
-        scaling_attention_score=True,
-        use_cache=False,
-):
-    if layer_past is not None:
-        past_key, past_value = layer_past[0], layer_past[1]
-        key_layer = torch.cat((past_key, key_layer), dim=0)
-        value_layer = torch.cat((past_value, value_layer), dim=0)
-
-    # seqlen, batch, num_attention_heads, hidden_size_per_attention_head
-    k_seq_len, b, nh, hidden_size = key_layer.shape
-    q_seq_len = query_layer.shape[0]
-
-    if use_cache:
-        present = (key_layer, value_layer)
-    else:
-        present = None
-
-    key_layer = key_layer.permute(1, 2, 0, 3).contiguous().view(b * nh, k_seq_len, hidden_size)
-    query_layer = query_layer.permute(1, 2, 0, 3).contiguous().view(b * nh, q_seq_len, hidden_size)
-    value_layer = value_layer.permute(1, 2, 0, 3).contiguous().view(b * nh, k_seq_len, hidden_size)
-
-    if not (attention_mask == 0).all():
-        attention_mask = attention_mask.squeeze(1)
-        xformer_attention_mask = torch.zeros(attention_mask.shape, dtype=key_layer.dtype, device=key_layer.device).masked_fill_(attention_mask, float('-inf'))
-        print(query_layer.shape)
-        print(key_layer.shape)
-        print(value_layer.shape)
-        print(xformer_attention_mask.shape)
-        context_layer = self.xformer_attention_module(query_layer, key_layer, value_layer, xformer_attention_mask).view(b, nh, q_seq_len, hidden_size).permute(2, 0, 1, 3).contiguous().view(q_seq_len, b, hidden_size_per_partition)
-    else:
-        context_layer = self.xformer_attention_module(query_layer, key_layer, value_layer).view(b, nh, q_seq_len, hidden_size).permute(2, 0, 1, 3).contiguous().view(q_seq_len, b, hidden_size_per_partition)
-    
-    return (context_layer, present, None)
-
-def xformer_efficient_attention_fn(
-        self,
-        query_layer,
-        key_layer,
-        value_layer,
-        attention_mask,
-        hidden_size_per_partition,
-        layer_id,
-        layer_past=None,
-        scaling_attention_score=True,
-        use_cache=False,
-):
-    if layer_past is not None:
-        past_key, past_value = layer_past[0], layer_past[1]
-        key_layer = torch.cat((past_key, key_layer), dim=0)
-        value_layer = torch.cat((past_value, value_layer), dim=0)
-
-    # seqlen, batch, num_attention_heads, hidden_size_per_attention_head
-    q_seq_len, b, _, _ = query_layer.shape
-
-    if use_cache:
-        present = (key_layer, value_layer)
-    else:
-        present = None
-
-    key_layer = key_layer.transpose(0, 1)
-    query_layer = query_layer.transpose(0, 1)
-    value_layer = value_layer.transpose(0, 1)
-    #print("Q: ", query_layer.shape)
-    #print("K: ", key_layer.shape)
-    #print("V: ", value_layer.shape)
-
-    if not (attention_mask == 0).all():
-        # Directly use causal mask
-        # attention_mask = attention_mask.squeeze(1)
-        # xformer_attention_mask = torch.zeros(attention_mask.shape, dtype=key_layer.dtype, device=key_layer.device).masked_fill_(attention_mask, float('-inf'))
-        context_layer = xops.memory_efficient_attention(query_layer, key_layer, value_layer, attn_bias=xops.LowerTriangularMask()).transpose(0, 1).view(q_seq_len, b, hidden_size_per_partition)
-        # context_layer = xops.memory_efficient_attention(query_layer, key_layer, value_layer, attn_bias=xops.LowerTriangularMask()).view(q_seq_len, b, hidden_size_per_partition)
-    else:
-        context_layer = xops.memory_efficient_attention(query_layer, key_layer, value_layer).view(q_seq_len, b, hidden_size_per_partition)
-    
-    return (context_layer, present, None)
-
 def default_init(cls, *args, **kwargs):
     return cls(*args, **kwargs)
 
@@ -466,17 +374,7 @@ class SelfAttention(torch.nn.Module):
             precision=torch.half,
             learnable=False,
         )
-        # self.attenion_function = attention_fn
-        self.attenion_function = xformer_efficient_attention_fn
-        # self.attenion_function = xformer_attention_fn
-        # self.attention_name = "scaled_dot_product"
-        # self.xformer_config = {
-        #     "name": self.attention_name,
-        #     "model_dim": hidden_size,
-        #     "num_heads": num_attention_heads,
-        #     "dropout": 0.0,
-        # }
-        # self.xformer_attention_module = build_attention(self.xformer_config)
+        self.attenion_function = attention_fn
         self.scale_mask_softmax = None
 
         if hidden_size_per_attention_head is None:
@@ -584,19 +482,7 @@ class SelfAttention(torch.nn.Module):
             layer_past=layer_past,
             use_cache=use_cache
         )
-
-        # context_layer, present, attention_probs = xformer_attention_fn(
-        #     self=self,
-        #     query_layer=query_layer,
-        #     key_layer=key_layer,
-        #     value_layer=value_layer,
-        #     attention_mask=attention_mask,
-        #     hidden_size_per_partition=self.hidden_size_per_partition,
-        #     layer_id=layer_id,
-        #     layer_past=layer_past,
-        #     use_cache=use_cache
-        # )
-
+        
         output = self.dense(context_layer)
 
         outputs = (output, present)
@@ -641,12 +527,6 @@ class GLU(torch.nn.Module):
             bias=bias,
             dtype=params_dtype,
         )
-        self.dense_h_to_4h_act = FusedLinear(
-            self.hidden_size,
-            self.inner_hidden_size,
-            bias=bias,
-            activation=Activation.GeLU
-        ).to(dtype=params_dtype)
         # Project back to h.
         self.dense_4h_to_h = init_method(
             torch.nn.Linear,
@@ -662,12 +542,9 @@ class GLU(torch.nn.Module):
         """
 
         # [seq_len, batch, inner_hidden_size]
+        intermediate_parallel = self.dense_h_to_4h(hidden_states)
 
-        # intermediate_parallel = self.dense_h_to_4h(hidden_states)
-
-        # intermediate_parallel = self.activation_func(intermediate_parallel)
-
-        intermediate_parallel = self.dense_h_to_4h_act(hidden_states)
+        intermediate_parallel = self.activation_func(intermediate_parallel)
 
         output = self.dense_4h_to_h(intermediate_parallel)
 

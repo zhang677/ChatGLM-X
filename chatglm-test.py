@@ -34,8 +34,13 @@ prompt = "判断题。人类交通的发展可以追溯到古代，从最早的�
 configuration = model.config
 for i in range(configuration.num_layers):
     model.transformer.layers[i].mlp.dense_h_to_4h_act.weight = model.transformer.layers[i].mlp.dense_h_to_4h.weight
+    del model.transformer.layers[i].mlp.dense_h_to_4h.weight
     model.transformer.layers[i].mlp.dense_h_to_4h_act.bias = model.transformer.layers[i].mlp.dense_h_to_4h.bias
-
+    del model.transformer.layers[i].mlp.dense_h_to_4h.bias
+    torch.cuda.empty_cache()
+response, history = model.chat(tokenizer, prompt, history=[])
+print(response)
+print("======================================")
 start = time.perf_counter()
 torch.cuda.cudart().cudaProfilerStart()
 response, history = model.chat(tokenizer, prompt, history=[])

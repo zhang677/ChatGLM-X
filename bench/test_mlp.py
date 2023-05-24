@@ -71,7 +71,7 @@ def bench_linear(activations: List[Optional[Activation]]):
     device = torch.device("cuda")
 
     for dtype in [
-        torch.bfloat16,
+        torch.float16,
     ]:
         for backward in [False]:
 
